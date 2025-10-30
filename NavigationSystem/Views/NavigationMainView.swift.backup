@@ -1,0 +1,501 @@
+//  NavigationMainView.swift
+//  GuideLight v3
+//
+//  Floating curved dock layout.
+//  Distance chip shows *steps to next waypoint* (user preference stepsPerMeter)
+//  Time chip uses *user walking speed* (walkingSpeedMps).
+//  Instruction line shows arrival message while visible; sticks to "Arrived" when state == .arrived.
+
+import SwiftUI
+import ARKit
+import SceneKit
+
+// MARK: - Main Navigation View
+struct NavigationMainView: View {
+    @StateObject private var relocalizationManager = ARRelocalizationManager()
+    @StateObject private var calibrationViewModel: CalibrationViewModel
+    @State private var navigationViewModel: NavigationViewModel?
+    
+    @State private var showingCalibration = true
+    @State private var showingDestinationPicker = false
+    @State private var arSession = ARSession()
+    
+    private let map: IndoorMap
+    private let mapFileName: String
+    
+    init(map: IndoorMap, mapFileName: String) {
+        self.map = map
+        self.mapFileName = mapFileName
+        _calibrationViewModel = StateObject(wrappedValue: CalibrationViewModel(
+            map: map,
+            relocalizationManager: ARRelocalizationManager()
+        ))
+    }
+    
+    var body: some View {
+        ZStack {
+            // AR Camera View (Full Screen)
+            if showingCalibration {
+                CalibrationARView(
+                    viewModel: calibrationViewModel,
+                    session: arSession,
+                    mapFileName: mapFileName
+                )
+            } else if let navViewModel = navigationViewModel {
+                NavigationARView(
+                    viewModel: navViewModel,
+                    session: arSession
+                )
+            }
+            
+            // Overlays
+            if showingCalibration {
+                calibrationOverlay
+            } else if let navViewModel = navigationViewModel {
+                navigationOverlay(navViewModel: navViewModel)
+            }
+        }
+        .ignoresSafeArea()
+        .sheet(isPresented: $showingDestinationPicker) {
+            if let navViewModel = navigationViewModel {
+                DestinationPickerView(
+                    viewModel: navViewModel,
+                    session: arSession,
+                    onSelected: { showingDestinationPicker = false }
+                )
+            }
+        }
+    }
+    
+    // MARK: - Calibration Overlay
+    private var calibrationOverlay: some View {
+        VStack {
+            Spacer()
+            
+            CalibrationProgressView(viewModel: calibrationViewModel)
+                .padding()
+            
+            if case .completed(let calibration) = calibrationViewModel.calibrationState {
+                if calibration.confidence < 0.6 {
+                    Text("⚠️ Low confidence. Consider recalibrating.")
+                        .font(.caption)
+                        .foregroundColor(.orange)
+                        .padding(.horizontal)
+                }
+                
+                Button {
+                    completeCalibration(calibration)
+                } label: {
+                    Text("Start Navigation")
+                        .font(.headline)
+                        .foregroundColor(.white)
+                        .frame(maxWidth: .infinity)
+                        .padding()
+                        .background(calibration.qualityRating == .poor ? Color.orange : Color.green)
+                        .cornerRadius(12)
+                }
+                .padding()
+            }
+        }
+    }
+    
+    // MARK: - Navigation Overlay (Floating Dock + Controls + Arrival)
+    private func navigationOverlay(navViewModel: NavigationViewModel) -> some View {
+        ZStack {
+            VStack {
+                Spacer()
+                
+                // Floating pill-shaped dock at bottom
+                FloatingDockView(
+                    viewModel: navViewModel,
+                    formatTimeShort: formatTimeShort,
+                    formatDistance: navViewModel.formatDistance
+                )
+                .padding(.horizontal, 16)
+                .padding(.bottom, 24)
+                
+                // Controls (pause/resume/cancel)
+                navigationControls(navViewModel: navViewModel)
+                    .padding(.bottom, 8)
+            }
+            
+            // Arrival Message Overlay
+            if navViewModel.showArrivalMessage, let message = navViewModel.arrivalMessage {
+                arrivalMessageView(message: message)
+            }
+        }
+    }
+    
+    // MARK: - Arrival Message View
+    private func arrivalMessageView(message: String) -> some View {
+        VStack {
+            Spacer()
+            
+            HStack {
+                Image(systemName: "checkmark.circle.fill")
+                    .font(.title)
+                    .foregroundColor(.green)
+                
+                Text(message)
+                    .font(.title2.weight(.bold))
+                    .foregroundColor(.white)
+            }
+            .padding(20)
+            .background(Color.black.opacity(0.8))
+            .cornerRadius(16)
+            .shadow(color: .black.opacity(0.3), radius: 10)
+            .transition(.scale.combined(with: .opacity))
+            .animation(.spring(response: 0.5, dampingFraction: 0.7), value: message)
+            
+            Spacer()
+            Spacer()
+        }
+    }
+    
+    // MARK: - Navigation Controls
+    private func navigationControls(navViewModel: NavigationViewModel) -> some View {
+        HStack(spacing: 20) {
+            if case .navigating = navViewModel.navigationState {
+                Button {
+                    navViewModel.pauseNavigation()
+                } label: {
+                    Image(systemName: "pause.fill")
+                        .font(.title2)
+                        .foregroundColor(.white)
+                        .frame(width: 56, height: 56)
+                        .background(Color.orange.opacity(0.95))
+                        .clipShape(Circle())
+                        .shadow(color: .black.opacity(0.3), radius: 5)
+                }
+            } else if case .paused = navViewModel.navigationState {
+                Button {
+                    navViewModel.resumeNavigation()
+                } label: {
+                    Image(systemName: "play.fill")
+                        .font(.title2)
+                        .foregroundColor(.white)
+                        .frame(width: 56, height: 56)
+                        .background(Color.green.opacity(0.95))
+                        .clipShape(Circle())
+                        .shadow(color: .black.opacity(0.3), radius: 5)
+                }
+            }
+            
+            Button {
+                navViewModel.cancelNavigation()
+                showingDestinationPicker = true
+            } label: {
+                Image(systemName: "xmark")
+                    .font(.title2)
+                    .foregroundColor(.white)
+                    .frame(width: 56, height: 56)
+                    .background(Color.red.opacity(0.95))
+                    .clipShape(Circle())
+                    .shadow(color: .black.opacity(0.3), radius: 5)
+            }
+        }
+    }
+    
+    // MARK: - Helper Methods
+    private func completeCalibration(_ calibration: CalibrationData) {
+        navigationViewModel = NavigationViewModel(map: map, calibration: calibration)
+        showingCalibration = false
+        showingDestinationPicker = true
+    }
+    
+    private func formatTimeShort(_ time: TimeInterval) -> String {
+        guard time.isFinite && time >= 0 else { return "—" }
+        let m = Int(time) / 60
+        let s = Int(time) % 60
+        if m >= 60 {
+            let h = m / 60
+            let rm = m % 60
+            return "\(h)h \(rm)m"
+        } else if m > 0 {
+            return "\(m)m \(s)s"
+        } else {
+            return "\(s)s"
+        }
+    }
+}
+
+// MARK: - Floating Curved Dock
+private struct FloatingDockView: View {
+    @ObservedObject var viewModel: NavigationViewModel
+    let formatTimeShort: (TimeInterval) -> String
+    let formatDistance: (Float) -> String   // kept for compatibility, unused for steps
+    
+    // 🔧 User preferences (editable from Settings)
+    @AppStorage("stepsPerMeter") private var stepsPerMeter: Double = 1.35       // avg adult ~1.3–1.5
+    @AppStorage("walkingSpeedMps") private var walkingSpeedMps: Double = 1.20   // m/s (slow indoor pace)
+    
+    var body: some View {
+        HStack(spacing: 16) {
+            // LEFT: Compact compass (rotating arrow)
+            MiniCompassView(headingError: viewModel.progress?.headingError ?? 0)
+                .frame(width: 84, height: 84)
+            
+            // RIGHT: Two rows
+            VStack(alignment: .leading, spacing: 8) {
+                // Row 1: Instruction / Arrival message precedence
+                if viewModel.showArrivalMessage, let msg = viewModel.arrivalMessage {
+                    Text(msg)
+                        .font(.system(size: 18, weight: .semibold))
+                        .foregroundColor(.white)
+                        .lineLimit(2)
+                        .minimumScaleFactor(0.85)
+                } else if case .arrived = viewModel.navigationState {
+                    Text("Arrived")
+                        .font(.system(size: 18, weight: .semibold))
+                        .foregroundColor(.white)
+                } else if let progress = viewModel.progress {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(progress.clockInstructionText)
+                            .font(.system(size: 18, weight: .semibold))
+                            .foregroundColor(.white)
+                            .lineLimit(2)
+                            .minimumScaleFactor(0.85)
+                        
+                        Text(progress.degreeHelperText)
+                            .font(.system(size: 12))
+                            .foregroundColor(.white.opacity(0.7))
+                    }
+                } else {
+                    Text("Align with your route")
+                        .font(.system(size: 18, weight: .semibold))
+                        .foregroundColor(.white.opacity(0.9))
+                }
+                
+                // Row 2: To/Next (left)  •  Steps / Time-to-next (right)
+                HStack(alignment: .center, spacing: 12) {
+                    // To / Next labels
+                    VStack(alignment: .leading, spacing: 2) {
+                        if let dest = viewModel.destinationBeacon {
+                            Text("To: \(dest.name)")
+                                .font(.system(size: 13, weight: .medium))
+                                .foregroundColor(.white.opacity(0.95))
+                                .lineLimit(1)
+                        }
+                        if let next = viewModel.currentWaypoint {
+                            Text("Next: \(next.name)")
+                                .font(.system(size: 12))
+                                .foregroundColor(.white.opacity(0.85))
+                                .lineLimit(1)
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    
+                    // Steps / Time chips
+                    if let progress = viewModel.progress {
+                        let steps = max(1, Int((Double(progress.distanceToNextWaypoint) * stepsPerMeter).rounded()))
+                        let timeToNext = TimeInterval(Double(progress.distanceToNextWaypoint) / max(0.2, walkingSpeedMps)) // guard divide-by-zero
+                        HStack(spacing: 8) {
+                            RoundedChip(text: steps == 1 ? "1 step" : "\(steps) steps")
+                            RoundedChip(text: formatTimeShort(timeToNext))
+                        }
+                    } else {
+                        HStack(spacing: 8) {
+                            RoundedChip(text: "—")
+                            RoundedChip(text: "—")
+                        }
+                    }
+                }
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 14)
+        .background(
+            Capsule()
+                .fill(Color.black.opacity(0.72))
+                .overlay(
+                    Capsule()
+                        .stroke(Color.white.opacity(0.12), lineWidth: 1)
+                )
+                .shadow(color: .black.opacity(0.35), radius: 12, x: 0, y: 8)
+        )
+        .animation(.easeInOut(duration: 0.2), value: viewModel.currentWaypoint?.id)
+        .animation(.easeInOut(duration: 0.2), value: viewModel.progress?.distanceToNextWaypoint)
+    }
+}
+
+// MARK: - Mini Compass
+private struct MiniCompassView: View {
+    let headingError: Float
+    
+    var body: some View {
+        ZStack {
+            Circle().fill(Color.black.opacity(0.35))
+            Circle().stroke(Color.white.opacity(0.30), lineWidth: 2).padding(6)
+            CompassTicks().stroke(Color.white.opacity(0.35), lineWidth: 2).padding(14)
+            ClockArrowHand(headingError: Double(headingError), color: .green)
+                .frame(width: 64, height: 64)
+        }
+    }
+}
+
+private struct CompassTicks: Shape {
+    func path(in rect: CGRect) -> Path {
+        var p = Path()
+        let center = CGPoint(x: rect.midX, y: rect.midY)
+        let r = min(rect.width, rect.height) / 2
+        let angles: [CGFloat] = [0, .pi/2, .pi, 3 * .pi/2]
+        for a in angles {
+            let inner = CGPoint(x: center.x + (r - 10) * cos(a),
+                                y: center.y + (r - 10) * sin(a))
+            let outer = CGPoint(x: center.x + r * cos(a),
+                                y: center.y + r * sin(a))
+            p.move(to: inner); p.addLine(to: outer)
+        }
+        return p
+    }
+}
+
+// MARK: - Rounded Chip
+private struct RoundedChip: View {
+    let text: String
+    var body: some View {
+        Text(text)
+            .font(.system(size: 13, weight: .semibold))
+            .foregroundColor(.white)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .background(Capsule().fill(Color.white.opacity(0.1)))
+    }
+}
+
+// MARK: - Clock Arrow Hand (unchanged visuals)
+struct ClockArrowHand: View {
+    let headingError: Double
+    let color: Color
+    
+    var body: some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: 6)
+                .fill(
+                    LinearGradient(colors: [color, color.opacity(0.7)],
+                                   startPoint: .bottom, endPoint: .top)
+                )
+                .frame(width: 12, height: 48)
+                .offset(y: -12)
+                .shadow(color: .black.opacity(0.35), radius: 3, x: 0, y: 2)
+            if abs(headingError) < 0.15 {
+                Circle()
+                    .fill(
+                        RadialGradient(colors: [color.opacity(0.35), .clear],
+                                       center: .center, startRadius: 20, endRadius: 56)
+                    )
+                    .frame(width: 84, height: 84)
+            }
+        }
+        .rotationEffect(.degrees(headingError * 180 / .pi))
+        .animation(.spring(response: 0.35, dampingFraction: 0.75), value: headingError)
+    }
+}
+
+// MARK: - Destination Picker (unchanged)
+struct DestinationPickerView: View {
+    @ObservedObject var viewModel: NavigationViewModel
+    @Environment(\.dismiss) private var dismiss
+    
+    let session: ARSession
+    let onSelected: () -> Void
+    
+    var body: some View {
+        NavigationView {
+            List(viewModel.availableDestinations) { beacon in
+                Button {
+                    selectDestination(beacon)
+                } label: {
+                    HStack {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(beacon.name).font(.headline)
+                            if !beacon.roomId.isEmpty,
+                               let room = viewModel.map.room(withId: beacon.roomId) {
+                                Text(room.name).font(.caption).foregroundColor(.secondary)
+                            }
+                        }
+                        Spacer()
+                        Image(systemName: "arrow.right.circle").foregroundColor(.blue)
+                    }
+                }
+            }
+            .navigationTitle("Select Destination")
+            .navigationBarTitleDisplayMode(.large)
+            .toolbar { ToolbarItem(placement: .navigationBarTrailing) { Button("Cancel") { dismiss() } } }
+        }
+    }
+    
+    private func selectDestination(_ beacon: Beacon) {
+        guard let frame = session.currentFrame else { return }
+        let currentPosition = CoordinateTransformManager.extractPosition(from: frame.camera)
+        viewModel.selectDestination(beacon, currentPosition: currentPosition, session: session)
+        onSelected(); dismiss()
+    }
+}
+
+// MARK: - Calibration Progress View (unchanged)
+struct CalibrationProgressView: View {
+    @ObservedObject var viewModel: CalibrationViewModel
+    
+    var body: some View {
+        VStack(spacing: 16) {
+            Text(viewModel.calibrationState.displayMessage)
+                .font(.headline)
+                .foregroundColor(.white)
+                .multilineTextAlignment(.center)
+            
+            if case .measuringBeacon(let index, let total) = viewModel.calibrationState {
+                VStack(spacing: 8) {
+                    Text("Beacon \(index + 1) of \(total)")
+                        .font(.title2.bold())
+                        .foregroundColor(.white)
+                    if index < viewModel.candidateBeacons.count {
+                        Text(viewModel.candidateBeacons[index].beacon.name)
+                            .font(.caption)
+                            .foregroundColor(.white.opacity(0.8))
+                    }
+                    ProgressView(value: viewModel.currentAlignment).tint(.green).frame(height: 8)
+                    Text("Alignment: \(Int(viewModel.currentAlignment * 100))%")
+                        .font(.caption).foregroundColor(.white.opacity(0.8))
+                    Button {
+                        Task { await viewModel.confirmBeaconMeasurement() }
+                    } label: {
+                        Text("Confirm")
+                            .font(.headline).foregroundColor(.white)
+                            .frame(maxWidth: .infinity).padding()
+                            .background(viewModel.canConfirmMeasurement ? Color.green : Color.gray)
+                            .cornerRadius(12)
+                    }
+                    .disabled(!viewModel.canConfirmMeasurement)
+                }
+            } else if case .completed(let calibration) = viewModel.calibrationState {
+                VStack(spacing: 8) {
+                    let icon = calibration.qualityRating == .excellent ? "✅" :
+                              calibration.qualityRating == .good ? "✅" :
+                              calibration.qualityRating == .fair ? "⚠️" : "❌"
+                    Text("\(icon) Calibration Complete")
+                        .font(.title2.bold())
+                        .foregroundColor(calibration.qualityRating == .poor ? .orange : .green)
+                    Text("Quality: \(calibration.qualityRating.rawValue)").font(.caption).foregroundColor(.white)
+                    Text("Confidence: \(Int(calibration.confidence * 100))%").font(.caption).foregroundColor(.white)
+                    Text("Consistency: \(String(format: "%.1f", 100 - calibration.residualError))%")
+                        .font(.caption)
+                        .foregroundColor(calibration.residualError > 20 ? .orange : .white.opacity(0.8))
+                    if calibration.confidence < 0.6 {
+                        Text("Consider recalibrating for better accuracy")
+                            .font(.caption2).foregroundColor(.orange).multilineTextAlignment(.center)
+                    }
+                }
+            }
+        }
+        .padding()
+        .background(Color.black.opacity(0.7))
+        .cornerRadius(16)
+    }
+}
+
+#Preview {
+    let sampleMap = IndoorMap(name: "Sample Home")
+    NavigationMainView(map: sampleMap, mapFileName: "sample.arworldmap")
+}
+

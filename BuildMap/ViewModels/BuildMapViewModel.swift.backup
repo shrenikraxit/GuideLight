@@ -1,0 +1,660 @@
+import Foundation
+import ARKit
+import SceneKit
+import Combine
+import simd
+
+// MARK: - Build Map View Model (FIXED WITH ARWORLDMAP SUPPORT)
+@MainActor
+class BuildMapViewModel: NSObject, ObservableObject {
+    
+    // MARK: - Published Properties
+    @Published var isARSessionRunning = false
+    @Published var arSessionState: ARSessionState = .notStarted
+    @Published var placementMode: PlacementMode = .beacon
+    @Published var currentMap: IndoorMap
+    @Published var selectedBeaconCategory: BeaconCategory = .destination
+    @Published var selectedDoorwayType: DoorwayType = .hinged_right
+    @Published var showingNameDialog = false
+    @Published var tempItemName = ""
+    @Published var errorMessage: String?
+    @Published var isPlacingDoorway = false
+    @Published var firstDoorwayPoint: simd_float3?
+    
+    // Room setup
+    @Published var showingRoomSetup = true
+    @Published var tempRoomName = ""
+    @Published var tempRoomType: RoomType = .general
+    @Published var tempFloorSurface: FloorSurface = .carpet
+    @Published var currentRoomId: String?
+    @Published var showingRoomSelector = false
+    // NEW: extra room attributes (transient form state)
+    @Published var tempRoomDescription: String = ""
+    @Published var tempRoomAddress: String = ""
+    @Published var tempRoomFloor: String = ""
+
+    
+    // Obstacle properties
+    @Published var isObstacleBeacon = false
+    @Published var obstacleWidth: Float = 0.6
+    @Published var obstacleDepth: Float = 0.4
+    @Published var obstacleHeight: Float = 1.0
+    
+    // Doorway properties
+    @Published var doorwayWidth: Float = 0.9
+    @Published var showingDoorwayDetails = false
+    @Published var isCompletingDoorway = false
+    
+    // Door action properties
+    @Published var selectedDoorAction: DoorAction = .push
+    @Published var selectedDoorActionFromOther: DoorAction = .pull
+    
+    // NEW: Saving state
+    @Published var isSavingMap = false
+    @Published var savingProgress: String = ""
+    
+    // MARK: - Private Properties
+    private var arSession = ARSession()
+    private var cancellables = Set<AnyCancellable>()
+    private var floorHeightOffset: Float = 0.0
+    private var pendingBeaconPosition: simd_float3?
+    private var pendingDoorwayPosition: simd_float3?
+    private var pendingDoorwayFromRoom: String?
+    
+    var session: ARSession { arSession }
+    
+    // MARK: - Initialization
+    override init() {
+        self.currentMap = IndoorMap(name: "New Map")
+        super.init()
+        setupARSession()
+    }
+    
+    // MARK: - Room Setup
+    func addRoom(name: String) {
+        // keep your existing validation if any
+        var updatedRooms = currentMap.rooms
+
+        let desc  = tempRoomDescription.trimmingCharacters(in: .whitespacesAndNewlines)
+        let addr  = tempRoomAddress.trimmingCharacters(in: .whitespacesAndNewlines)
+        let floor = tempRoomFloor.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        // NOTE: This assumes Room has the two optional fields already added (address, floorOfBuilding)
+        let newRoom = Room(
+            name: name,
+            type: tempRoomType,
+            floorSurface: tempFloorSurface,
+            description: desc.isEmpty ? nil : desc,
+            address: addr.isEmpty ? nil : addr,
+            floorOfBuilding: floor.isEmpty ? nil : floor
+        )
+
+        updatedRooms.append(newRoom)
+        currentMap = currentMap.updated(rooms: updatedRooms)
+
+        // reset transient fields for next entry (keep your existing resets and add the three below)
+        tempRoomDescription = ""
+        tempRoomAddress = ""
+        tempRoomFloor = ""
+
+        // keep your existing logging / analytics
+        print("✅ ROOM ADDED: \(name) • type=\(newRoom.type) • floor=\(newRoom.floorOfBuilding ?? "-")")
+    }
+
+    
+    func removeRoom(at index: Int) {
+        guard index < currentMap.rooms.count else { return }
+        var updatedRooms = currentMap.rooms
+        updatedRooms.remove(at: index)
+        currentMap = currentMap.updated(rooms: updatedRooms)
+    }
+    
+    func completeRoomSetup() {
+        guard !currentMap.rooms.isEmpty else {
+            errorMessage = "Please add at least one room before continuing"
+            return
+        }
+        showingRoomSetup = false
+        startARSession()
+    }
+    
+    func selectRoom(id: String) {
+        currentRoomId = id
+    }
+    
+    var currentRoom: Room? {
+        guard let roomId = currentRoomId else { return nil }
+        return currentMap.room(withId: roomId)
+    }
+    
+    // MARK: - AR Session Management
+    private func setupARSession() {
+        arSession.delegate = self
+        let configuration = ARWorldTrackingConfiguration()
+        configuration.planeDetection = [.horizontal]
+        configuration.environmentTexturing = .automatic
+        arSession.run(configuration)
+        arSessionState = .starting
+    }
+    
+    func startARSession() {
+        guard !isARSessionRunning else { return }
+        let configuration = ARWorldTrackingConfiguration()
+        configuration.planeDetection = [.horizontal]
+        configuration.environmentTexturing = .automatic
+        arSession.run(configuration, options: [.resetTracking, .removeExistingAnchors])
+        isARSessionRunning = true
+        arSessionState = .running
+        print("🔥 Started AR mapping session")
+    }
+    
+    func pauseARSession() {
+        arSession.pause()
+        isARSessionRunning = false
+        arSessionState = .paused
+    }
+    
+    func resetARSession() {
+        arSession.run(ARWorldTrackingConfiguration(), options: [.resetTracking, .removeExistingAnchors])
+        floorHeightOffset = 0.0
+        firstDoorwayPoint = nil
+        isPlacingDoorway = false
+        arSessionState = .running
+        print("🔄 Reset AR mapping session")
+    }
+    
+    // MARK: - Placement Mode Management
+    func setPlacementMode(_ mode: PlacementMode) {
+        placementMode = mode
+        if mode != .doorway {
+            cancelDoorwayPlacement()
+        }
+    }
+    
+    private func cancelDoorwayPlacement() {
+        isPlacingDoorway = false
+        firstDoorwayPoint = nil
+        pendingDoorwayPosition = nil
+        pendingDoorwayFromRoom = nil
+    }
+    
+    // MARK: - Placement Logic
+    func handleTap(at screenPoint: CGPoint, in view: ARSCNView) {
+        guard arSessionState == .running else { return }
+        guard currentRoomId != nil else {
+            errorMessage = "Please select a room first"
+            showingRoomSelector = true
+            return
+        }
+        
+        guard let raycastResult = performRaycast(from: screenPoint, in: view) else {
+            errorMessage = "Could not find floor surface. Try pointing at the floor."
+            return
+        }
+        
+        let worldPosition = raycastResult.worldTransform.translation
+        
+        switch placementMode {
+        case .beacon:
+            startBeaconPlacement(at: worldPosition)
+        case .doorway:
+            handleDoorwayPlacement(at: worldPosition)
+        case .waypoint:
+            startWaypointPlacement(at: worldPosition)
+        }
+    }
+    
+    private func performRaycast(from screenPoint: CGPoint, in view: ARSCNView) -> ARRaycastResult? {
+        let raycastQuery = view.raycastQuery(from: screenPoint, allowing: .existingPlaneGeometry, alignment: .horizontal)
+        if let query = raycastQuery {
+            let results = arSession.raycast(query)
+            if let result = results.first {
+                return result
+            }
+        }
+        
+        let estimatedQuery = view.raycastQuery(from: screenPoint, allowing: .estimatedPlane, alignment: .horizontal)
+        if let query = estimatedQuery {
+            let results = arSession.raycast(query)
+            return results.first
+        }
+        
+        return nil
+    }
+    
+    // MARK: - Beacon Placement
+    private func startBeaconPlacement(at position: simd_float3) {
+        pendingBeaconPosition = position
+        tempItemName = ""
+        isObstacleBeacon = false
+        showingNameDialog = true
+    }
+    
+    func confirmBeaconPlacement() {
+        guard let position = pendingBeaconPosition,
+              let roomId = currentRoomId,
+              !tempItemName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            errorMessage = "Please enter a name for the beacon"
+            return
+        }
+        
+        let physicalProps: PhysicalProperties? = isObstacleBeacon ? PhysicalProperties(
+            isObstacle: true,
+            boundingBox: BoundingBox(width: obstacleWidth, depth: obstacleDepth, height: obstacleHeight),
+            avoidanceRadius: obstacleWidth + 0.2,
+            canRouteAround: true,
+            obstacleType: .furniture
+        ) : nil
+        
+        let beacon = Beacon(
+            name: tempItemName.trimmingCharacters(in: .whitespacesAndNewlines),
+            position: position,
+            category: selectedBeaconCategory,
+            roomId: roomId,
+            description: nil,
+            audioLandmark: nil,
+            isAccessible: true,
+            accessibilityNotes: nil,
+            physicalProperties: physicalProps
+        )
+        
+        var updatedBeacons = currentMap.beacons
+        updatedBeacons.append(beacon)
+        currentMap = currentMap.updated(beacons: updatedBeacons)
+        
+        print("🎯 BEACON: \(beacon.name) in \(currentRoom?.name ?? "?")")
+        
+        pendingBeaconPosition = nil
+        tempItemName = ""
+        isObstacleBeacon = false
+        showingNameDialog = false
+    }
+    
+    // MARK: - Doorway Placement
+    private func handleDoorwayPlacement(at position: simd_float3) {
+        guard let roomId = currentRoomId else {
+            errorMessage = "Please select a room first"
+            showingRoomSelector = true
+            return
+        }
+        
+        pendingDoorwayPosition = position
+        pendingDoorwayFromRoom = roomId
+        
+        tempItemName = ""
+        doorwayWidth = 0.9
+        selectedDoorwayType = .hinged_right
+        selectedDoorAction = .push
+        selectedDoorActionFromOther = .pull
+        
+        showingDoorwayDetails = true
+    }
+    
+    func confirmDoorwayPlacement() {
+        guard pendingDoorwayPosition != nil,
+              pendingDoorwayFromRoom != nil,
+              !tempItemName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            errorMessage = "Please enter doorway details"
+            return
+        }
+        
+        isCompletingDoorway = true
+        showingRoomSelector = true
+    }
+    
+    func completeDoorwayWithDestinationRoom(toRoom: String) {
+        guard let position = pendingDoorwayPosition,
+              let fromRoom = pendingDoorwayFromRoom,
+              fromRoom != toRoom else {
+            errorMessage = "Please select a different room for the destination"
+            isCompletingDoorway = false
+            return
+        }
+        
+        let doorway = Doorway(
+            name: tempItemName.trimmingCharacters(in: .whitespacesAndNewlines),
+            position: position,
+            width: doorwayWidth,
+            height: 2.1,
+            connectsRooms: ConnectedRooms(roomA: fromRoom, roomB: toRoom),
+            doorType: selectedDoorwayType,
+            doorActions: DoorActions(
+                fromRoomA: selectedDoorAction,
+                fromRoomB: selectedDoorActionFromOther
+            ),
+            isAccessible: true,
+            description: nil,
+            audioLandmark: nil
+        )
+        
+        var updatedDoorways = currentMap.doorways
+        updatedDoorways.append(doorway)
+        currentMap = currentMap.updated(doorways: updatedDoorways)
+        
+        let fromRoomName = currentMap.room(withId: fromRoom)?.name ?? "?"
+        let toRoomName = currentMap.room(withId: toRoom)?.name ?? "?"
+        print("🚪 DOORWAY: \(doorway.name)")
+        print("   Connects: \(fromRoomName) ↔ \(toRoomName)")
+        print("   From \(fromRoomName): \(selectedDoorAction.rawValue)")
+        print("   From \(toRoomName): \(selectedDoorActionFromOther.rawValue)")
+        
+        cancelDoorwayPlacement()
+        tempItemName = ""
+        showingDoorwayDetails = false
+        isCompletingDoorway = false
+    }
+    
+    // MARK: - Helper: Quick Door Action Setup
+    func setDoorAsHinged(pushFromCurrent: Bool) {
+        if pushFromCurrent {
+            selectedDoorAction = .push
+            selectedDoorActionFromOther = .pull
+        } else {
+            selectedDoorAction = .pull
+            selectedDoorActionFromOther = .push
+        }
+    }
+
+    func setDoorAsSwinging() {
+        selectedDoorAction = .push
+        selectedDoorActionFromOther = .push
+    }
+
+    func setDoorAsAutomatic() {
+        selectedDoorAction = .automatic
+        selectedDoorActionFromOther = .automatic
+    }
+
+    func setDoorAsOpen() {
+        selectedDoorAction = .walkThrough
+        selectedDoorActionFromOther = .walkThrough
+    }
+    
+    // MARK: - Waypoint Placement
+    private func startWaypointPlacement(at position: simd_float3) {
+        pendingBeaconPosition = position
+        tempItemName = ""
+        showingNameDialog = true
+    }
+    
+    func confirmWaypointPlacement() {
+        guard let position = pendingBeaconPosition,
+              let roomId = currentRoomId,
+              !tempItemName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            errorMessage = "Please enter a name for the waypoint"
+            return
+        }
+        
+        // New field defaults to empty — you can link beacons later via an edit flow
+        let waypoint = Waypoint(
+            name: tempItemName.trimmingCharacters(in: .whitespacesAndNewlines),
+            coordinates: position,
+            roomId: roomId,
+            waypointType: .navigation,
+            isAccessible: true,
+            description: nil,
+            audioLandmark: nil,
+            connectedBeacons: [] // ← start empty; can be populated when you define edges
+        )
+        
+        var updatedWaypoints = currentMap.waypoints
+        updatedWaypoints.append(waypoint)
+        currentMap = currentMap.updated(waypoints: updatedWaypoints)
+        
+        print("📍 WAYPOINT: \(waypoint.name) in \(currentRoom?.name ?? "?")")
+        
+        pendingBeaconPosition = nil
+        tempItemName = ""
+        showingNameDialog = false
+    }
+    
+    // MARK: - Item Management
+    func removeBeacon(_ beacon: Beacon) {
+        let updatedBeacons = currentMap.beacons.filter { $0.id != beacon.id }
+        currentMap = currentMap.updated(beacons: updatedBeacons)
+    }
+    
+    func removeDoorway(_ doorway: Doorway) {
+        let updatedDoorways = currentMap.doorways.filter { $0.id != doorway.id }
+        currentMap = currentMap.updated(doorways: updatedDoorways)
+    }
+    
+    func cancelPlacement() {
+        pendingBeaconPosition = nil
+        pendingDoorwayPosition = nil
+        tempItemName = ""
+        showingNameDialog = false
+        showingDoorwayDetails = false
+        isCompletingDoorway = false
+        cancelDoorwayPlacement()
+    }
+    
+    // MARK: - Map Management
+    func updateMapName(_ name: String) {
+        guard !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        currentMap = IndoorMap(
+            name: name.trimmingCharacters(in: .whitespacesAndNewlines),
+            description: currentMap.description,
+            rooms: currentMap.rooms,
+            beacons: currentMap.beacons,
+            doorways: currentMap.doorways,
+            waypoints: currentMap.waypoints
+        )
+    }
+    
+    func clearMap() {
+        currentMap = IndoorMap(name: currentMap.name)
+        cancelDoorwayPlacement()
+        currentRoomId = nil
+        print("🧹 Cleared map data")
+    }
+    
+    // MARK: - FIXED: Save Map with ARWorldMap Support
+    func saveMap(completion: ((Bool) -> Void)? = nil) {
+        let mapData = currentMap.toNewJSONFormat()
+        let mapName = currentMap.name.isEmpty ? "Map \(Date().formatted(.dateTime.day().month().year().hour().minute()))" : currentMap.name
+        
+        print("💾 SAVING MAP WITH ARWORLDMAP:")
+        print("   Name: \(mapName)")
+        print("   Rooms: \(currentMap.rooms.count)")
+        print("   Beacons: \(currentMap.beacons.count)")
+        print("   Doorways: \(currentMap.doorways.count)")
+        print("   Waypoints: \(currentMap.waypoints.count)")
+        
+        // Set saving state
+        isSavingMap = true
+        savingProgress = "Capturing ARWorldMap..."
+        
+        // Capture ARWorldMap from the session
+        SimpleJSONMapManager.shared.captureWorldMap(from: arSession) { [weak self] captureResult in
+            guard let self = self else {
+                completion?(false)
+                return
+            }
+            
+            Task { @MainActor in
+                switch captureResult {
+                case .success(let worldMap):
+                    print("✅ ARWorldMap captured successfully")
+                    print("   - Anchors: \(worldMap.anchors.count)")
+                    print("   - Feature points: \(worldMap.rawFeaturePoints.points.count)")
+                    
+                    self.savingProgress = "Saving ARWorldMap to file..."
+                    
+                    // Save ARWorldMap to file
+                    let fileName = "worldmap_\(UUID().uuidString).arworldmap"
+                    SimpleJSONMapManager.shared.saveARWorldMapToFile(worldMap: worldMap, fileName: fileName) { [weak self] saveResult in
+                        guard let self = self else {
+                            completion?(false)
+                            return
+                        }
+                        
+                        Task { @MainActor in
+                            switch saveResult {
+                            case .success(let fileURL):
+                                print("✅ ARWorldMap saved to file: \(fileURL.lastPathComponent)")
+                                
+                                self.savingProgress = "Creating map..."
+                                
+                                // Create JSONMap with ARWorldMap reference
+                                let jsonMap = JSONMap(
+                                    name: mapName,
+                                    jsonData: mapData,
+                                    description: "Indoor map with ARWorldMap support",
+                                    arWorldMapFileName: fileName
+                                )
+                                
+                                SimpleJSONMapManager.shared.addMap(jsonMap)
+                                SimpleJSONMapManager.shared.resetCurrentSession()
+                                
+                                print("✅ Map saved successfully with ARWorldMap!")
+                                
+                                self.isSavingMap = false
+                                self.savingProgress = ""
+                                completion?(true)
+                                
+                            case .failure(let error):
+                                print("⚠️ Failed to save ARWorldMap file: \(error)")
+                                print("   Falling back to save without ARWorldMap...")
+                                
+                                // Fallback: Save without ARWorldMap
+                                self.saveMapWithoutARWorldMap(mapName: mapName, mapData: mapData)
+                                completion?(false)
+                            }
+                        }
+                    }
+                    
+                case .failure(let error):
+                    print("⚠️ Failed to capture ARWorldMap: \(error)")
+                    print("   Falling back to save without ARWorldMap...")
+                    
+                    // Fallback: Save without ARWorldMap
+                    self.saveMapWithoutARWorldMap(mapName: mapName, mapData: mapData)
+                    completion?(false)
+                }
+            }
+        }
+    }
+    
+    // MARK: - Fallback: Save without ARWorldMap
+    private func saveMapWithoutARWorldMap(mapName: String, mapData: [String: Any]) {
+        savingProgress = "Saving map (without ARWorldMap)..."
+        
+        let jsonMap = JSONMap(
+            name: mapName,
+            jsonData: mapData,
+            description: "Indoor map (no ARWorldMap)"
+        )
+        
+        SimpleJSONMapManager.shared.addMap(jsonMap)
+        SimpleJSONMapManager.shared.resetCurrentSession()
+        
+        print("💾 Map saved without ARWorldMap")
+        
+        isSavingMap = false
+        savingProgress = ""
+    }
+    
+    func clearError() {
+        errorMessage = nil
+    }
+}
+
+// MARK: - Placement Mode
+enum PlacementMode: String, CaseIterable {
+    case beacon = "beacon"
+    case doorway = "doorway"
+    case waypoint = "waypoint"
+    
+    var displayName: String {
+        switch self {
+        case .beacon: return "Beacon"
+        case .doorway: return "Doorway"
+        case .waypoint: return "Waypoint"
+        }
+    }
+    
+    var icon: String {
+        switch self {
+        case .beacon: return "flag.fill"
+        case .doorway: return "rectangle.portrait.and.arrow.right"
+        case .waypoint: return "mappin.circle.fill"
+        }
+    }
+}
+
+// MARK: - AR Session State
+enum ARSessionState: Equatable {
+    case notStarted, starting, running, paused
+    case failed(String)
+    
+    var displayName: String {
+        switch self {
+        case .notStarted: return "Not Started"
+        case .starting: return "Starting..."
+        case .running: return "Running"
+        case .paused: return "Paused"
+        case .failed(let errorMsg): return "Failed: \(errorMsg)"
+        }
+    }
+    
+    static func == (lhs: ARSessionState, rhs: ARSessionState) -> Bool {
+        switch (lhs, rhs) {
+        case (.notStarted, .notStarted), (.starting, .starting),
+             (.running, .running), (.paused, .paused):
+            return true
+        case (.failed(let lhsError), .failed(let rhsError)):
+            return lhsError == rhsError
+        default:
+            return false
+        }
+    }
+}
+
+// MARK: - ARSessionDelegate
+extension BuildMapViewModel: ARSessionDelegate {
+    nonisolated func session(_ session: ARSession, didUpdate frame: ARFrame) {
+        Task { @MainActor in
+            if self.arSessionState != .running && session.currentFrame != nil {
+                self.arSessionState = .running
+            }
+        }
+    }
+    
+    nonisolated func session(_ session: ARSession, didAdd anchors: [ARAnchor]) {
+        for anchor in anchors {
+            if let planeAnchor = anchor as? ARPlaneAnchor, planeAnchor.alignment == .horizontal {
+                Task { @MainActor in
+                    if self.floorHeightOffset == 0.0 {
+                        self.floorHeightOffset = planeAnchor.transform.translation.y
+                    }
+                }
+            }
+        }
+    }
+    
+    nonisolated func session(_ session: ARSession, didFailWithError error: Error) {
+        Task { @MainActor in
+            self.arSessionState = .failed(error.localizedDescription)
+            self.errorMessage = "AR Session failed: \(error.localizedDescription)"
+        }
+    }
+    
+    nonisolated func sessionWasInterrupted(_ session: ARSession) {
+        Task { @MainActor in
+            self.arSessionState = .paused
+        }
+    }
+    
+    nonisolated func sessionInterruptionEnded(_ session: ARSession) {
+        Task { @MainActor in
+            self.arSessionState = .running
+        }
+    }
+}
+
+extension matrix_float4x4 {
+    var translation: simd_float3 {
+        return simd_float3(columns.3.x, columns.3.y, columns.3.z)
+    }
+}

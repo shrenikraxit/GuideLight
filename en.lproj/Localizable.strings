@@ -1,0 +1,8 @@
+"voice.welcome"       = "Welcome to GuideLight.";
+"voice.startPrompt"   = "Say 'Start navigation' or double tap anywhere.";
+"voice.homeHelp"      = "Pathfinder for navigation, or tap the gear for Settings.";
+"voice.startingNav"   = "Starting navigation.";
+"voice.pathfinderSel" = "Pathfinder selected.";
+"voice.settingsSel"   = "Settings selected.";
+"voice.helpSel"       = "Help selected,";
+"voice.errorNoMap"    = "No map found. Please build or import a map.";
